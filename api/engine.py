@@ -8,6 +8,8 @@ from langchain_experimental.agents import create_pandas_dataframe_agent
 from langchain_classic.chains import RetrievalQA
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 from sentence_transformers import SentenceTransformer
 
 
@@ -43,6 +45,7 @@ class QueryEngine:
         self.df = None
         self.rag_chain = None
         self.vectorstore = None
+        self.all_docs = []  # Store docs for BM25
         self._initialized = True
         
         self.processing = False
@@ -122,13 +125,32 @@ class QueryEngine:
                 
                 self.processing_progress = min(i + BATCH_SIZE, total_docs)
             
+            print("Creating hybrid retriever (BM25 + Semantic)...")
+            self.status_message = "Creating hybrid retriever..."
+
+            # Store docs for BM25
+            self.all_docs = all_docs
+
+            # Create BM25 retriever (keyword search)
+            bm25_retriever = BM25Retriever.from_documents(all_docs)
+            bm25_retriever.k = 10
+
+            # Create semantic retriever
+            semantic_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
+
+            # Combine with ensemble (50% BM25, 50% semantic)
+            hybrid_retriever = EnsembleRetriever(
+                retrievers=[bm25_retriever, semantic_retriever],
+                weights=[0.5, 0.5]
+            )
+
             print("Creating RAG chain...")
             self.status_message = "Finalizing..."
-            
+
             self.rag_chain = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 chain_type="stuff",
-                retriever=self.vectorstore.as_retriever(search_kwargs={"k": 5})
+                retriever=hybrid_retriever
             )
             
             self.processing = False
@@ -182,19 +204,28 @@ class QueryEngine:
         """Use LLM to decide if query needs structured (SQL/pandas) or semantic (RAG) approach."""
         columns_info = ", ".join(self.df.columns.tolist()) if self.df is not None else "unknown"
 
-        prompt = f"""You are a query router. Given a user question about a dataset, decide the best approach:
+        prompt = f"""You are a query router for a tabular dataset. Decide the best approach:
 
-STRUCTURED: Use for questions that need exact data operations like:
-- Counts, totals, averages, sums (e.g., "how many", "total number")
-- Filtering by specific values (e.g., "ticket number 190", "where status is open")
-- Grouping/aggregations (e.g., "breakdown by category", "most common")
-- Sorting/ranking (e.g., "top 10", "highest rated")
-- Lookups by ID or specific field value
+STRUCTURED (use pandas/SQL operations) - Choose for:
+- Counts, totals, sums, averages ("how many", "total", "count", "average")
+- Filtering by column values ("where status is open", "tickets from email")
+- Grouping/aggregations ("breakdown by", "group by", "per category")
+- Sorting/ranking ("top 10", "highest", "lowest", "most common")
+- Lookups by ID or specific value ("ticket 190", "find customer John")
+- Finding ALL matching records ("find all", "list all", "show all tickets with")
+- Comparisons ("how many X vs Y", "more than", "less than")
+- Date/time queries ("tickets from last week", "created in January")
+- Column-based questions ("what channels", "what types", "unique values")
 
-SEMANTIC: Use for questions that need meaning-based search like:
-- Finding similar content (e.g., "reviews about battery issues")
-- Understanding sentiment or themes (e.g., "what are customers complaining about")
-- Open-ended exploration (e.g., "tell me about shipping problems")
+SEMANTIC (use RAG/similarity search) - Choose for:
+- Understanding content/meaning ("what are people saying about", "sentiment")
+- Finding similar themes ("issues like", "complaints about", "problems with")
+- Summarizing patterns ("common themes", "main concerns")
+- Open-ended exploration ("tell me about", "describe", "explain")
+- Questions about text content not filterable by exact column values
+
+KEY RULE: If the question can be answered by filtering/counting DataFrame columns, choose STRUCTURED.
+Only choose SEMANTIC when you need to understand the meaning of text content.
 
 Dataset columns: {columns_info}
 
