@@ -1,13 +1,13 @@
 # Hybrid RAG System for Tabular Data
 
-A production-grade RAG (Retrieval-Augmented Generation) system that handles both structured queries (counts, aggregations, lookups) and semantic queries (meaning-based search) on Excel/CSV data.
+A RAG  system that handles both structured queries (counts, aggregations, lookups) and semantic queries (meaning-based search) on Excel/CSV data.
 
 ## Features
 
 - **Hybrid Query Routing**: LLM-based router intelligently directs queries to the appropriate pipeline
 - **Text-to-Code**: Pandas agent for structured queries (counts, filters, aggregations)
 - **Semantic Search**: Hybrid retrieval combining BM25 + vector embeddings
-- **Local Embeddings**: SentenceTransformers (all-MiniLM-L6-v2) - no API costs
+- **Local Embeddings**: SentenceTransformers (all-MiniLM-L6-v2)
 - **Real-time Progress**: Background processing with live progress tracking
 - **Production Logging**: Timestamped logs with processing metrics
 
@@ -36,7 +36,7 @@ rag_project/
 │   └── urls.py        # API routing
 ├── app.py             # Streamlit frontend
 ├── requirements.txt
-├── .env               # API keys (not in repo)
+├── .env               # API keys 
 └── .gitignore
 ```
 
@@ -131,7 +131,6 @@ Tested on 8,469 customer support tickets:
 
 | Metric | Value |
 |--------|-------|
-| Embedding time | ~10 mins (CPU) |
 | Query response | 2-5 seconds |
 | Embedding rate | ~14 docs/sec |
 | Routing accuracy | 100% |
