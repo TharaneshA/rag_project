@@ -1,7 +1,11 @@
 import os
+import sys
+import logging
+import time
 import pandas as pd
 import threading
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_groq import ChatGroq
 from langchain_chroma import Chroma
 from langchain_experimental.agents import create_pandas_dataframe_agent
@@ -11,6 +15,16 @@ from langchain_core.embeddings import Embeddings
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from sentence_transformers import SentenceTransformer
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.INFO)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
 
 
 class LocalEmbeddings(Embeddings):
@@ -37,9 +51,9 @@ class QueryEngine:
         if self._initialized:
             return
         
-        print("Loading local embedding model...")
+        logger.info("Loading local embedding model...")
         self.embeddings = LocalEmbeddings("all-MiniLM-L6-v2")
-        print("Embedding model loaded!")
+        logger.info("Embedding model loaded!")
         
         self.llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
         self.df = None
@@ -75,63 +89,102 @@ class QueryEngine:
     
     def _process_embeddings_batched(self):
         try:
-            BATCH_SIZE = 500  # Larger batches = faster
-            
+            BATCH_SIZE = 500
+            NUM_WORKERS = 4
+            start_time = time.time()
+
             self.status_message = "Clearing old data..."
             if os.path.exists("./chroma_db"):
                 shutil.rmtree("./chroma_db")
-            
+
             self.status_message = "Reading rows..."
-            print("Starting document creation...")
-            
-            # Create documents - update progress here
             all_docs = []
+            all_texts = []
             total = len(self.df)
+            total_chars = 0
+
             for idx, row in self.df.iterrows():
                 row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
                 if row_text.strip():
                     all_docs.append(Document(page_content=row_text, metadata={"row_index": idx}))
-                
-                # Update progress every 100 rows
-                if idx % 100 == 0:
+                    all_texts.append(row_text)
+                    total_chars += len(row_text)
+
+                if idx % 500 == 0:
                     self.processing_progress = idx
                     self.status_message = f"Reading rows: {idx}/{total}"
-            
-            self.processing_progress = total
-            print(f"Created {len(all_docs)} documents")
-            
-            # Now embed in batches
-            self.status_message = "Embedding..."
+
             total_docs = len(all_docs)
-            self.vectorstore = None
-            
-            print(f"Starting embedding of {total_docs} documents in batches of {BATCH_SIZE}...")
-            
-            for i in range(0, total_docs, BATCH_SIZE):
-                batch = all_docs[i:i + BATCH_SIZE]
-                batch_num = i // BATCH_SIZE + 1
-                total_batches = (total_docs + BATCH_SIZE - 1) // BATCH_SIZE
-                
-                self.status_message = f"Embedding batch {batch_num}/{total_batches}"
-                self.processing_progress = i
-                print(f"Embedding batch {batch_num}/{total_batches}...")
-                
-                if self.vectorstore is None:
-                    self.vectorstore = Chroma.from_documents(
-                        batch, self.embeddings, persist_directory="./chroma_db"
-                    )
-                else:
-                    self.vectorstore.add_documents(batch)
-                
-                self.processing_progress = min(i + BATCH_SIZE, total_docs)
-            
-            print("Creating hybrid retriever (BM25 + Semantic)...")
+            num_batches = (total_docs + BATCH_SIZE - 1) // BATCH_SIZE
+
+            logger.info(f"Rows: {total} | Chunks: {total_docs} | Text size: {total_chars/1024:.1f}KB")
+            logger.info(f"Embedding model: all-MiniLM-L6-v2 | Batch: {BATCH_SIZE} | Workers: {NUM_WORKERS} | Batches: {num_batches}")
+
+            self.status_message = "Computing embeddings (parallel)..."
+
+            # Split texts into batches for parallel processing
+            batches = [all_texts[i:i + BATCH_SIZE] for i in range(0, len(all_texts), BATCH_SIZE)]
+            all_embeddings = [None] * len(batches)
+            completed = 0
+
+            def embed_batch(batch_idx, texts):
+                return batch_idx, self.embeddings.model.encode(texts, show_progress_bar=False).tolist()
+
+            # Process batches in parallel
+            with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                futures = {executor.submit(embed_batch, i, batch): i for i, batch in enumerate(batches)}
+
+                for future in as_completed(futures):
+                    batch_idx, embeddings = future.result()
+                    all_embeddings[batch_idx] = embeddings
+                    completed += 1
+                    self.processing_progress = int((completed / len(batches)) * total_docs * 0.7)
+                    self.status_message = f"Embedding batch {completed}/{len(batches)}"
+                    logger.info(f"Embedded batch {completed}/{len(batches)}")
+
+            # Flatten embeddings list
+            flat_embeddings = []
+            for batch_emb in all_embeddings:
+                flat_embeddings.extend(batch_emb)
+
+            logger.info(f"All embeddings computed: {len(flat_embeddings)}")
+
+            # Add to ChromaDB with pre-computed embeddings
+            self.status_message = "Storing in vector database..."
+            logger.info("Adding to ChromaDB...")
+
+            self.vectorstore = Chroma(
+                persist_directory="./chroma_db",
+                embedding_function=self.embeddings
+            )
+
+            CHROMA_BATCH = 1000
+            for i in range(0, total_docs, CHROMA_BATCH):
+                batch_docs = all_docs[i:i + CHROMA_BATCH]
+                batch_texts = [doc.page_content for doc in batch_docs]
+                batch_embeddings = flat_embeddings[i:i + CHROMA_BATCH]
+                batch_metadatas = [doc.metadata for doc in batch_docs]
+                batch_ids = [f"doc_{i+j}" for j in range(len(batch_docs))]
+
+                self.vectorstore._collection.add(
+                    documents=batch_texts,
+                    embeddings=batch_embeddings,
+                    metadatas=batch_metadatas,
+                    ids=batch_ids
+                )
+
+                self.processing_progress = int(total_docs * 0.7 + (i / total_docs) * total_docs * 0.3)
+                self.status_message = f"Storing: {min(i + CHROMA_BATCH, total_docs)}/{total_docs}"
+
+            self.processing_progress = total_docs
+
+            logger.info("Creating hybrid retriever (BM25 + Semantic)...")
             self.status_message = "Creating hybrid retriever..."
 
             # Store docs for BM25
             self.all_docs = all_docs
 
-            # Create BM25 retriever (keyword search)
+            # Create BM25 retriever 
             bm25_retriever = BM25Retriever.from_documents(all_docs)
             bm25_retriever.k = 10
 
@@ -144,7 +197,7 @@ class QueryEngine:
                 weights=[0.5, 0.5]
             )
 
-            print("Creating RAG chain...")
+            logger.info("Creating RAG chain...")
             self.status_message = "Finalizing..."
 
             self.rag_chain = RetrievalQA.from_chain_type(
@@ -155,12 +208,14 @@ class QueryEngine:
             
             self.processing = False
             self.status_message = "Ready!"
-            print("Processing complete!")
-            
+            total_time = time.time() - start_time
+            docs_per_sec = total_docs / total_time if total_time > 0 else 0
+            logger.info(f"Processing complete! Total time: {total_time:.1f}s | Rate: {docs_per_sec:.1f} docs/sec")
+
         except Exception as e:
             import traceback
             err = traceback.format_exc()
-            print(f"ERROR: {err}")
+            logger.error(f"Processing failed: {err}")
             self.processing_error = str(e)
             self.processing = False
     
@@ -186,9 +241,19 @@ class QueryEngine:
         
         try:
             if route == "structured":
+                prefix = f"""You are a data analyst working with a pandas DataFrame called `df`.
+DataFrame has {len(self.df)} rows and {len(self.df.columns)} columns.
+Columns: {', '.join(self.df.columns.tolist())}
+
+IMPORTANT:
+- Always query the FULL dataframe, never use sample or head
+- Execute code and return actual numbers/results
+- For aggregations, show complete results with all values"""
+
                 agent = create_pandas_dataframe_agent(
                     self.llm, self.df, verbose=True, allow_dangerous_code=True,
-                    agent_type="tool-calling"
+                    agent_type="tool-calling",
+                    prefix=prefix
                 )
                 result = agent.invoke(question)
                 return result["output"], "text-to-code"
@@ -237,10 +302,10 @@ Reply with exactly one word: STRUCTURED or SEMANTIC"""
             response = self.llm.invoke(prompt)
             answer = response.content.strip().upper()
             route = "structured" if "STRUCTURED" in answer else "semantic"
-            print(f"Router decision: {route} (LLM said: {answer})")
+            logger.info(f"Router decision: {route} (LLM said: {answer})")
             return route
         except Exception as e:
-            print(f"Router error, defaulting to semantic: {e}")
+            logger.warning(f"Router error, defaulting to semantic: {e}")
             return "semantic"
 
 
